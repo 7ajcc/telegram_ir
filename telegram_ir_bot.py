@@ -1,3 +1,4 @@
+# COMMIT TEST
 import asyncio
 import os
 import re
@@ -12,20 +13,35 @@ from telegram.ext import (
 from playwright.async_api import async_playwright, Browser, Playwright, Page
 
 BASE_IP = "dz.ps.ai"
-TELEGRAM_BOT_TOKEN = "8865575150:AAEwkRhuAi2U_5SE0tgdUX_-HoyFi0NabOA"
+TELEGRAM_BOT_TOKEN = "8865575150:AAHM6z4x5hzoPQoeXumT5VuIR4A1cDYUcmE"
 ALLOWED_USERS_FILE = "/home/castv/.cc/allowed_users.txt"
+IDLE_TIMEOUT_SECONDS = 30  # Auto-close idle sessions after 30 seconds
+
+# Centralized Customizable Telegram Messages
+MESSAGES = {
+    "UNAUTHORIZED": "⛔ Access denied.",
+    "CONNECTING": "⏳ Connecting to `beIN {channel}`...",
+    "CONNECTED": "✅ Connected to `beIN {channel}`",
+    "KEY_SENT": "⚡ `beIN {channel}` ➔ IR {key} Sent",
+    "COMBO_SENT": "🚀 `beIN {channel}` ➔ Bmail Removed",
+    "NO_SESSION": "⚠️ No active session found. Please select STB first.",
+    "SESSION_CLOSED": "🔒 Session for `beIN {channel}` has been closed successfully.",
+    "SESSION_TIMEOUT": "⏱️ Session for `beIN {channel}` closed automatically due to 30s inactivity.",
+    "NO_ACTIVE_SESSION": "ℹ️ No active session running.",
+    "SESSION_LOST": "⚠️ Session to `beIN {channel}` lost. Re-select STB.",
+    "ERROR": "❌ Error on `beIN {channel}`: {error}",
+}
 
 # Map Reply Keyboard button labels to exact raw IR parameters or key sequences
-# Combos can now use tuples ("KEY", delay_in_ms_after) for customized step timing
 IR_KEY_MAP = {
-    # Custom Combo Shortcut with precise menu-wait timing
-    "❌ MSG": [
-        ("BEIN", 2000),   # 2.0 sec wait for beIN menu animation to render
+    # Custom Combo Shortcut with precise menu timing
+    "✉️ MSG": [
+        ("BEIN", 2000),   # 2.0 sec wait for beIN menu animation
         ("RIGHT", 1000),  # 1.0 sec arrow press
         ("RIGHT", 1000),  # 1.0 sec arrow press
-        ("OK", 1500),     # 1.5 sec wait for sub-menu to load
+        ("OK", 1500),     # 1.5 sec wait for sub-menu
         ("RIGHT", 1000),  # 1.0 sec arrow press
-        ("OK", 1500),     # 1.5 sec wait for action execution
+        ("OK", 1500),     # 1.5 sec wait for action
         ("EXIT", 1000),   # 1.0 sec exit menu
     ],
     # System & Audio
@@ -58,7 +74,7 @@ IR_KEY_MAP = {
 playwright_obj: Playwright = None
 browser_obj: Browser = None
 
-# Active session store: chat_id -> {"channel": str, "page": Page, "port": str}
+# Active session store: chat_id -> {"channel": str, "page": Page, "port": str, "timer_task": Task}
 ACTIVE_SESSIONS: dict[int, dict] = {}
 
 
@@ -83,7 +99,7 @@ def is_user_allowed(user_id: int, chat_id: int) -> bool:
 def get_reply_keyboard() -> ReplyKeyboardMarkup:
     """Generates the remote control grid with numbers, navigation, and MSG combo."""
     keyboard = [
-        [KeyboardButton("❌ MSG")],
+        [KeyboardButton("✉️ MSG")],
         [KeyboardButton("🔴 Power"), KeyboardButton("⚙️ beIN"), KeyboardButton("🔊 Vol +"), KeyboardButton("🔉 Vol -")],
         [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
         [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
@@ -96,10 +112,18 @@ def get_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-async def close_chat_session(chat_id: int):
-    """Closes and cleans up any open browser tab for a chat session."""
+async def close_chat_session(chat_id: int) -> str | None:
+    """Closes browser tab and timer for a chat session without cancelling itself."""
     if chat_id in ACTIVE_SESSIONS:
         session = ACTIVE_SESSIONS.pop(chat_id)
+        channel_str = session.get("channel")
+        
+        # Cancel running timeout task ONLY if it is not the currently executing task
+        timer_task = session.get("timer_task")
+        current_task = asyncio.current_task()
+        if timer_task and timer_task != current_task and not timer_task.done():
+            timer_task.cancel()
+
         page: Page = session.get("page")
         if page and not page.is_closed():
             try:
@@ -107,19 +131,52 @@ async def close_chat_session(chat_id: int):
             except Exception:
                 pass
 
+        return channel_str
+    return None
+
+
+async def auto_close_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Waits for timeout duration and sends an auto-close confirmation message if idle."""
+    try:
+        await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+        channel_str = await close_chat_session(chat_id)
+        if channel_str:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=MESSAGES["SESSION_TIMEOUT"].format(channel=channel_str),
+                    reply_markup=ReplyKeyboardRemove(),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                print(f"Error sending timeout notification to chat {chat_id}: {e}")
+    except asyncio.CancelledError:
+        pass  # Timer was reset by new user activity
+
+
+def reset_inactivity_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Resets the idle countdown task for an active session."""
+    if chat_id in ACTIVE_SESSIONS:
+        session = ACTIVE_SESSIONS[chat_id]
+        old_timer = session.get("timer_task")
+        if old_timer and not old_timer.done():
+            old_timer.cancel()
+
+        session["timer_task"] = asyncio.create_task(auto_close_timer(chat_id, context))
+
 
 async def open_device_session(chat_id: int, channel_str: str) -> str:
     """Logs into target ESP32 device once and keeps the tab open in background."""
     global browser_obj
 
-    # Close previous active session if running
+    # Clean up previous session cleanly
     await close_chat_session(chat_id)
 
     try:
         channel_num = int(channel_str)
         port = f"30{channel_num:02d}"
     except ValueError:
-        return f"❌ Invalid channel format: `{channel_str}`."
+        return MESSAGES["ERROR"].format(channel=channel_str, error="Invalid channel format")
 
     url = f"http://{BASE_IP}:{port}/login"
 
@@ -127,7 +184,6 @@ async def open_device_session(chat_id: int, channel_str: str) -> str:
         return "❌ Persistent browser engine not initialized."
 
     try:
-        # Open tab and authenticate
         page = await browser_obj.new_page()
         await page.goto(url, timeout=10000)
         await page.fill("input[name='username']", "admin")
@@ -137,24 +193,23 @@ async def open_device_session(chat_id: int, channel_str: str) -> str:
         await page.wait_for_url(lambda u: "/login" not in u, timeout=10000)
         await page.wait_for_function("typeof window.ir === 'function'", timeout=10000)
 
-        # Store tab in session memory
         ACTIVE_SESSIONS[chat_id] = {
             "channel": channel_str,
             "page": page,
             "port": port,
+            "timer_task": None,
         }
 
-        # Send initial channel digit(s) safely via argument passing
         keys = [f"NUM_{digit}" for digit in channel_str]
         for key in keys:
             await page.evaluate("(k) => window.ir(k)", key)
             await page.wait_for_timeout(150)
 
-        return f"✅ Connected to `Device {channel_str}` (Port `{port}`). Sent `{', '.join(keys)}`."
+        return MESSAGES["CONNECTED"].format(channel=channel_str, port=port)
 
     except Exception as e:
         await close_chat_session(chat_id)
-        return f"❌ Error connecting to Device {channel_str} (port {port}): {str(e)}"
+        return MESSAGES["ERROR"].format(channel=channel_str, error=str(e))
 
 
 async def send_instant_ir_key(chat_id: int, ir_key: str | list, default_delay_ms: int = 1500) -> str:
@@ -162,45 +217,42 @@ async def send_instant_ir_key(chat_id: int, ir_key: str | list, default_delay_ms
     session = ACTIVE_SESSIONS.get(chat_id)
 
     if not session or not session.get("page"):
-        return "⚠️ No active session found. Please select a device using `/chXX` first."
+        return MESSAGES["NO_SESSION"]
 
     page: Page = session["page"]
     channel_str = session["channel"]
 
     if page.is_closed():
-        ACTIVE_SESSIONS.pop(chat_id, None)
-        return f"⚠️ Session to Device {channel_str} lost. Re-select device with `/ch{channel_str.zfill(2)}`."
+        await close_chat_session(chat_id)
+        return MESSAGES["SESSION_LOST"].format(channel=channel_str.zfill(2))
 
     keys_to_send = ir_key if isinstance(ir_key, list) else [ir_key]
     executed_keys = []
 
     try:
         for idx, item in enumerate(keys_to_send):
-            # Parse key name and step delay
             if isinstance(item, (tuple, list)):
-                raw_key = item[0]
-                step_delay = int(item[1])
+                raw_key, step_delay = item[0], int(item[1])
             else:
-                raw_key = item
-                step_delay = default_delay_ms
+                raw_key, step_delay = item, default_delay_ms
 
-            # Clean ir('...') string wrappers if present
             clean_key = re.sub(r"^ir\(['\"]?(.*?)['\"]?\)$", r"\1", str(raw_key).strip())
 
             await page.evaluate("(k) => window.ir(k)", clean_key)
-            executed_keys.append(clean_key)
 
-            # Wait delay between sequential commands in combo
+            display_key = re.sub(r"^NUM_", "", clean_key)
+            executed_keys.append(display_key)
+
             if idx < len(keys_to_send) - 1:
                 await page.wait_for_timeout(step_delay)
 
         if len(executed_keys) > 1:
-            return f"⚡ `Device {channel_str}`: Sent Combo `[{', '.join(executed_keys)}]`"
+            return MESSAGES["COMBO_SENT"].format(channel=channel_str, keys=", ".join(executed_keys))
         else:
-            return f"⚡ `Device {channel_str}`: Sent `{executed_keys[0]}`"
+            return MESSAGES["KEY_SENT"].format(channel=channel_str, key=executed_keys[0])
 
     except Exception as e:
-        return f"❌ Error executing command: {str(e)}"
+        return MESSAGES["ERROR"].format(channel=channel_str, error=str(e))
 
 
 async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,7 +264,7 @@ async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
 
     if not is_user_allowed(user_id, chat_id):
-        await update.message.reply_text("⛔ Unauthorized user. Access denied.")
+        await update.message.reply_text(MESSAGES["UNAUTHORIZED"])
         return
 
     command_text = update.message.text.strip()
@@ -221,39 +273,51 @@ async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not match:
         return
 
-    # Strip leading zeros (e.g. "01" -> "1", "14" -> "14")
     new_channel = str(int(match.group(1)))
 
-    await update.message.reply_text(f"⏳ Connecting & opening session for `Device {new_channel}`...", parse_mode="Markdown")
+    connecting_msg = await update.message.reply_text(
+        MESSAGES["CONNECTING"].format(channel=new_channel), 
+        parse_mode="Markdown"
+    )
 
     result = await open_device_session(chat_id, new_channel)
 
+    try:
+        await connecting_msg.delete()
+    except Exception:
+        pass
+
+    reset_inactivity_timer(chat_id, context)
+
     await update.message.reply_text(
-        f"{result}\n\n🎮 **Active Session: `Device {new_channel}`**\nRemote buttons will execute instantly. Send `/close` to exit session.",
+        result,
         reply_markup=get_reply_keyboard(),
         parse_mode="Markdown",
     )
 
 
 async def close_session_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Closes active device session, closes browser tab, and removes reply keyboard."""
+    """Closes active device session, removes keyboard, and replies with explicit confirmation."""
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = update.effective_chat.id if update.effective_chat else None
 
     if not is_user_allowed(user_id, chat_id):
-        await update.message.reply_text("⛔ Unauthorized user. Access denied.")
+        await update.message.reply_text(MESSAGES["UNAUTHORIZED"])
         return
 
-    if chat_id in ACTIVE_SESSIONS:
-        channel_str = ACTIVE_SESSIONS[chat_id]["channel"]
-        await close_chat_session(chat_id)
+    closed_channel = await close_chat_session(chat_id)
+
+    if closed_channel:
         await update.message.reply_text(
-            f"🔒 Closed session for `Device {channel_str}`. Browser tab closed.",
+            MESSAGES["SESSION_CLOSED"].format(channel=closed_channel),
             reply_markup=ReplyKeyboardRemove(),
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text("ℹ️ No active session running.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            MESSAGES["NO_ACTIVE_SESSION"], 
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
 async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +329,7 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id if update.effective_chat else None
 
     if not is_user_allowed(user_id, chat_id):
-        await update.message.reply_text("⛔ Unauthorized user. Access denied.")
+        await update.message.reply_text(MESSAGES["UNAUTHORIZED"])
         return
 
     button_text = update.message.text.strip()
@@ -275,6 +339,10 @@ async def reply_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     ir_key = IR_KEY_MAP[button_text]
     result = await send_instant_ir_key(chat_id, ir_key)
+
+    # Reset 30s timeout on button interaction
+    reset_inactivity_timer(chat_id, context)
+
     await update.message.reply_text(result, parse_mode="Markdown")
 
 
@@ -311,7 +379,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/ch\d+$"), channel_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_button_handler))
 
-    print("Telegram IR Bot running with Instant Persistent Sessions & Precise ✉️ MSG Combo...")
+    print("Telegram IR Bot running with fixed auto-close notifications...")
     app.run_polling()
 
 
