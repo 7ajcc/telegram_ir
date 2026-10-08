@@ -13,7 +13,7 @@ from telegram.ext import (
 from playwright.async_api import async_playwright, Browser, Playwright, Page
 
 BASE_IP = "dz.ps.ai"
-TELEGRAM_BOT_TOKEN = "8865575150:AAHM6z4x5hzoPQoeXumT5VuIR4A1cDYUcmE"
+TELEGRAM_BOT_TOKEN = ""
 ALLOWED_USERS_FILE = "/home/castv/.cc/allowed_users.txt"
 IDLE_TIMEOUT_SECONDS = 30  # Auto-close idle sessions after 30 seconds
 
